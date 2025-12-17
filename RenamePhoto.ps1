@@ -4,16 +4,17 @@ Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Security
 
 # =========================
-# RenamePhoto v6.9 (UTF-8 filename charset fix)
+# RenamePhoto v6.9.1
 #
-# exiftool path:
-#   <scriptDir>\exiftool\exiftool.exe
+# tools:
+#   exiftool: <scriptDir>\tools\exiftool\exiftool*.exe (auto find)
+#   magick : <scriptDir>\tools\magick\magick.exe
 #
 # GUI:
 #   pick source folder -> pick destination folder
 #
 # Supports:
-#   PHOTO: CR3/JPG/JPEG/PNG
+#   PHOTO: CR3/JPG/JPEG/PNG/HEIC (HEIC -> converted to JPG)
 #   VIDEO: MP4/MOV/WMV
 #
 # Rename format:
@@ -41,6 +42,11 @@ Add-Type -AssemblyName System.Security
 # Resume:
 #   enabled by default (can be turned off)
 #   uses resume state file to skip already-processed sources
+#
+# HEIC:
+#   - Convert to JPG with magick (quality 92)
+#   - Copy metadata from HEIC -> JPG using exiftool
+#   - Output EXT becomes .JPG
 # =========================
 
 # -------------------------
@@ -53,13 +59,31 @@ $EnableResume = $true
 # Example: 0.01 => log about 1% of COPY lines
 $CopySampleRate = 0.0
 
+# HEIC convert quality
+$HeicJpgQuality = 92
+
 # -------------------------
-# Paths
+# Paths (tools\...)
 # -------------------------
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$exiftool  = Join-Path $scriptDir "exiftool\exiftool.exe"
-if (!(Test-Path -LiteralPath $exiftool)) {
-    throw ("exiftool.exe not found: " + $exiftool)
+
+# exiftool auto find: tools\exiftool\exiftool*.exe
+$exiftoolDir = Join-Path $scriptDir "tools\exiftool"
+if (!(Test-Path -LiteralPath $exiftoolDir)) {
+    throw ("exiftool folder not found: " + $exiftoolDir)
+}
+$exiftoolFound = Get-ChildItem -LiteralPath $exiftoolDir -Filter "exiftool*.exe" -File -ErrorAction SilentlyContinue |
+                 Sort-Object Name |
+                 Select-Object -First 1
+if (-not $exiftoolFound) {
+    throw ("exiftool*.exe not found in: " + $exiftoolDir)
+}
+$exiftool = $exiftoolFound.FullName
+
+# magick fixed path: tools\magick\magick.exe
+$magick = Join-Path $scriptDir "tools\magick\magick.exe"
+if (!(Test-Path -LiteralPath $magick)) {
+    throw ("magick.exe not found: " + $magick)
 }
 
 # -------------------------
@@ -97,7 +121,6 @@ function Try-ParseExifDate([string]$s) {
 }
 
 function Get-DeviceTag([hashtable]$meta) {
-    # Try to identify iPhone via Make/Model if available; otherwise use Canon model mapping.
     $modelRaw = $meta.model
     $makeRaw  = $meta.make
 
@@ -146,20 +169,40 @@ function Get-IdSmartHash([System.IO.FileInfo]$file) {
     return $hex.Substring(0, 6).ToUpper()
 }
 
-# Fast metadata via exiftool -T
-# NOTE: Added -charset filename=utf8 to remove "FileName encoding must be specified" warnings.
+function New-DirIfMissing([string]$p) {
+    if (!(Test-Path -LiteralPath $p)) { New-Item -ItemType Directory -Path $p | Out-Null }
+}
+
+function Format-TS([TimeSpan]$ts) {
+    return "{0:00}:{1:00}:{2:00}" -f [int]$ts.TotalHours, $ts.Minutes, $ts.Seconds
+}
+
+function Should-LogCopySample([double]$rate) {
+    if ($rate -le 0) { return $false }
+    return ((Get-Random) / 2147483647.0) -lt $rate
+}
+
+function Get-ResumeKey([System.IO.FileInfo]$f) {
+    return ("{0}|{1}|{2}" -f $f.FullName, $f.Length, $f.LastWriteTimeUtc.Ticks)
+}
+
+# -------------------------
+# exiftool metadata read (UTF-8 filename charset)
 # Order:
 #   DateTimeOriginal | Make | Model |
 #   QuickTime:CreateDate | QuickTime:MediaCreateDate |
 #   MediaCreateDate | CreateDate
+# -------------------------
 function Read-MetaFast([string]$path) {
-    $line = & $exiftool `
-        -charset filename=utf8 `
-        -s -s -s -T `
-        -DateTimeOriginal -Make -Model `
-        -QuickTime:CreateDate -QuickTime:MediaCreateDate `
-        -MediaCreateDate -CreateDate `
+    $args = @(
+        "-charset","filename=utf8",
+        "-s","-s","-s","-T",
+        "-DateTimeOriginal","-Make","-Model",
+        "-QuickTime:CreateDate","-QuickTime:MediaCreateDate",
+        "-MediaCreateDate","-CreateDate",
         $path
+    )
+    $line = & $exiftool @args
 
     $parts = $line -split "`t", -1
     while ($parts.Count -lt 7) { $parts += "" }
@@ -183,8 +226,30 @@ function Get-VideoDateTime([hashtable]$meta) {
     return $dt
 }
 
-function New-DirIfMissing([string]$p) {
-    if (!(Test-Path -LiteralPath $p)) { New-Item -ItemType Directory -Path $p | Out-Null }
+# -------------------------
+# HEIC convert + metadata copy
+# - returns temp JPG path
+# -------------------------
+function Convert-HeicToJpgWithMeta([string]$srcHeicPath, [string]$tempJpgPath, [int]$quality) {
+    # 1) Convert (magick)
+    # magick "a.heic" -quality 92 "out.jpg"
+    $null = & $magick $srcHeicPath "-quality" "$quality" $tempJpgPath
+
+    if (!(Test-Path -LiteralPath $tempJpgPath)) {
+        throw ("HEIC conversion failed: " + $srcHeicPath)
+    }
+
+    # 2) Copy metadata (exiftool)
+    # exiftool -overwrite_original -TagsFromFile SRC -all:all>all:all DST
+    $args = @(
+        "-charset","filename=utf8",
+        "-overwrite_original",
+        "-TagsFromFile", $srcHeicPath,
+        "-all:all>all:all",
+        $tempJpgPath
+    )
+    $null = & $exiftool @args
+    return $tempJpgPath
 }
 
 # -------------------------
@@ -212,16 +277,18 @@ if ($LogMode -ne "OFF") {
     ("Start: " + (Get-Date)) | Out-File -FilePath $logPath -Encoding utf8
     ("SCRIPT: " + $scriptDir) | Out-File -FilePath $logPath -Append -Encoding utf8
     ("EXIFTOOL: " + $exiftool) | Out-File -FilePath $logPath -Append -Encoding utf8
+    ("MAGICK: " + $magick) | Out-File -FilePath $logPath -Append -Encoding utf8
     ("SRC: " + $srcRoot) | Out-File -FilePath $logPath -Append -Encoding utf8
     ("DST: " + $dstRoot) | Out-File -FilePath $logPath -Append -Encoding utf8
     ("LogMode: " + $LogMode) | Out-File -FilePath $logPath -Append -Encoding utf8
     ("Resume: " + $EnableResume) | Out-File -FilePath $logPath -Append -Encoding utf8
+    ("HEIC->JPG quality: " + $HeicJpgQuality) | Out-File -FilePath $logPath -Append -Encoding utf8
     "" | Out-File -FilePath $logPath -Append -Encoding utf8
 
     ("Start: " + (Get-Date)) | Out-File -FilePath $errLogPath -Encoding utf8
 }
 
-# Resume state file (store processed source file fingerprints)
+# Resume state file
 $resumePath = Join-Path $dstRoot "resume_state_v6.9.txt"
 $resumeSet = New-Object "System.Collections.Generic.HashSet[string]"
 if ($EnableResume -and (Test-Path -LiteralPath $resumePath)) {
@@ -234,8 +301,6 @@ if ($EnableResume -and (Test-Path -LiteralPath $resumePath)) {
 
 # Existing destination cache (HashSet)
 $existingSet = New-Object "System.Collections.Generic.HashSet[string]"
-# We'll cache only file names (case-insensitive) within PHOTO/VIDEO.
-# For Windows this is usually enough and very fast.
 function Cache-Existing([string]$root) {
     $photo = Join-Path $root "PHOTO"
     $video = Join-Path $root "VIDEO"
@@ -253,10 +318,10 @@ function Cache-Existing([string]$root) {
 Cache-Existing $dstRoot
 
 # -------------------------
-# Collect files
+# Collect files (HEIC included)
 # -------------------------
 $files = Get-ChildItem -LiteralPath $srcRoot -Recurse -File | Where-Object {
-    $_.Extension -match '^\.(CR3|JPG|JPEG|PNG|MP4|MOV|WMV)$'
+    $_.Extension -match '^\.(CR3|JPG|JPEG|PNG|HEIC|MP4|MOV|WMV)$'
 }
 
 $total = $files.Count
@@ -270,27 +335,14 @@ $skipped = 0
 $resumeSkipped = 0
 $errors = 0
 $fallback = 0
+$heicConverted = 0
 
 # Timing
 $start = Get-Date
-$lastProgressUpdate = Get-Date
 
-# helper: format time span
-function Format-TS([TimeSpan]$ts) {
-    return "{0:00}:{1:00}:{2:00}" -f [int]$ts.TotalHours, $ts.Minutes, $ts.Seconds
-}
-
-# optional: should we log copy line (sampling)
-function Should-LogCopySample([double]$rate) {
-    if ($rate -le 0) { return $false }
-    return ((Get-Random) / 2147483647.0) -lt $rate
-}
-
-# fingerprint for resume
-function Get-ResumeKey([System.IO.FileInfo]$f) {
-    # stable enough fingerprint for "same source file"
-    return ("{0}|{1}|{2}" -f $f.FullName, $f.Length, $f.LastWriteTimeUtc.Ticks)
-}
+# temp folder (for HEIC->JPG)
+$tempRoot = Join-Path $env:TEMP ("RenamePhoto_tmp_" + (Get-Date -Format "yyyyMMdd_HHmmss"))
+New-DirIfMissing $tempRoot
 
 # -------------------------
 # Main loop
@@ -308,12 +360,16 @@ foreach ($f in $files) {
         }
     }
 
+    $tempMade = $null
+
     try {
         $ext = $f.Extension.ToUpper()
+
         $isVideo = ($ext -in @(".MP4", ".MOV", ".WMV"))
+        $isHeic  = ($ext -eq ".HEIC")
         $mediaFolder = $(if ($isVideo) { "VIDEO" } else { "PHOTO" })
 
-        # Read metadata
+        # Read metadata from ORIGINAL file (HEIC 포함)
         $meta = Read-MetaFast $f.FullName
         $device = Get-DeviceTag $meta
 
@@ -336,9 +392,15 @@ foreach ($f in $files) {
         $dstDir = Join-Path $dstRoot (Join-Path $mediaFolder (Join-Path ($dt.ToString("yyyy")) (Join-Path ($dt.ToString("MM")) ($dt.ToString("dd")))))
         New-DirIfMissing $dstDir
 
+        # Output extension:
+        # - HEIC => .JPG (converted)
+        # - else keep original extension
+        $outExt = $ext
+        if ($isHeic) { $outExt = ".JPG" }
+
         # Filename: YYYY-MM-DD_HH-mm-ss_<ID>_<DEVICE>.EXT
         $base = ("{0}_{1}_{2}_{3}" -f $dt.ToString("yyyy-MM-dd"), $dt.ToString("HH-mm-ss"), $id, $device)
-        $target = Join-Path $dstDir ($base + $ext)
+        $target = Join-Path $dstDir ($base + $outExt)
 
         # Fast skip by cached set
         if ($existingSet.Contains($target.ToLower()) -or (Test-Path -LiteralPath $target)) {
@@ -353,14 +415,25 @@ foreach ($f in $files) {
         # If collision, add suffix
         $i = 1
         while (Test-Path -LiteralPath $target) {
-            $target = Join-Path $dstDir (("{0}_{1:D2}{2}" -f $base, $i, $ext))
+            $target = Join-Path $dstDir (("{0}_{1:D2}{2}" -f $base, $i, $outExt))
             $i++
         }
 
-        Copy-Item -LiteralPath $f.FullName -Destination $target
-        $copied++
+        # Copy source:
+        # - HEIC => convert to temp jpg + copy metadata + then copy that jpg to target
+        # - else => normal Copy-Item
+        if ($isHeic) {
+            $tempJpg = Join-Path $tempRoot ("heic_{0}.jpg" -f ([guid]::NewGuid().ToString("N")))
+            $tempMade = $tempJpg
 
-        # Update existing cache
+            Convert-HeicToJpgWithMeta -srcHeicPath $f.FullName -tempJpgPath $tempJpg -quality $HeicJpgQuality | Out-Null
+            Copy-Item -LiteralPath $tempJpg -Destination $target
+            $heicConverted++
+        } else {
+            Copy-Item -LiteralPath $f.FullName -Destination $target
+        }
+
+        $copied++
         [void]$existingSet.Add($target.ToLower())
 
         # Log
@@ -371,10 +444,9 @@ foreach ($f in $files) {
             ("COPY(sample): " + $f.FullName + " -> " + $target) | Out-File -FilePath $logPath -Append -Encoding utf8
         }
 
-        # Resume state append (write-through in memory; flush periodically to file)
+        # Resume state append (crash safe)
         if ($EnableResume -and $resumeKey) {
             if ($resumeSet.Add($resumeKey)) {
-                # append to resume file directly for crash safety (small text line)
                 try { $resumeKey | Out-File -FilePath $resumePath -Append -Encoding utf8 } catch { }
             }
         }
@@ -388,6 +460,12 @@ foreach ($f in $files) {
         }
         if ($LogMode -eq "FULL" -and $logPath) {
             $msgErr | Out-File -FilePath $logPath -Append -Encoding utf8
+        }
+    }
+    finally {
+        # cleanup temp (HEIC)
+        if ($tempMade -and (Test-Path -LiteralPath $tempMade)) {
+            try { Remove-Item -LiteralPath $tempMade -Force -ErrorAction SilentlyContinue } catch { }
         }
     }
 
@@ -407,12 +485,15 @@ foreach ($f in $files) {
     if ($total -gt 0) { $pct = [int](($done / [double]$total) * 100) }
 
     Write-Progress -Activity "Renaming and copying..." `
-        -Status ("{0}/{1} copied:{2} skipped:{3} resumeSkip:{4} errors:{5} | elapsed:{6} ETA:{7} total(est):{8}" -f `
-            $done,$total,$copied,$skipped,$resumeSkipped,$errors,(Format-TS $elapsed),(Format-TS $eta),(Format-TS $totalEst)) `
+        -Status ("{0}/{1} copied:{2} skipped:{3} resumeSkip:{4} heic->jpg:{5} errors:{6} | elapsed:{7} ETA:{8} total(est):{9}" -f `
+            $done,$total,$copied,$skipped,$resumeSkipped,$heicConverted,$errors,(Format-TS $elapsed),(Format-TS $eta),(Format-TS $totalEst)) `
         -PercentComplete $pct
 }
 
 Write-Progress -Activity "Renaming and copying..." -Completed
+
+# Cleanup temp folder
+try { Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue } catch { }
 
 # Final timing
 $end = Get-Date
@@ -425,21 +506,21 @@ if ($total -gt 0 -and $elapsedAll.TotalSeconds -gt 0) {
 
 if ($LogMode -ne "OFF" -and $logPath) {
     ("End: " + (Get-Date)) | Out-File -FilePath $logPath -Append -Encoding utf8
-    ("Summary: total={0} copied={1} skipped={2} resumeSkip={3} fallback={4} errors={5} elapsed={6} avg={7} files/sec" -f `
-        $total,$copied,$skipped,$resumeSkipped,$fallback,$errors,$elapsedAllStr,$avgSpeed) | Out-File -FilePath $logPath -Append -Encoding utf8
+    ("Summary: total={0} copied={1} skipped={2} resumeSkip={3} heic2jpg={4} fallback={5} errors={6} elapsed={7} avg={8} files/sec" -f `
+        $total,$copied,$skipped,$resumeSkipped,$heicConverted,$fallback,$errors,$elapsedAllStr,$avgSpeed) | Out-File -FilePath $logPath -Append -Encoding utf8
 }
 
-# SAFE MessageBox (no parsing issues)
 $mainLogText = $(if ($logPath) { $logPath } else { "(OFF)" })
 $resumeText  = $(if ($EnableResume) { $resumePath } else { "(disabled)" })
 
 $msg = @"
-Done! (v6.9)
+Done! (v6.9.1)
 
 Total: $total
 Copied: $copied
 Skipped: $skipped
 ResumeSkipped: $resumeSkipped
+HEIC->JPG: $heicConverted
 Fallback(LastWriteTime): $fallback
 Errors: $errors
 Elapsed: $elapsedAllStr
