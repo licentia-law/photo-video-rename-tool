@@ -4,6 +4,19 @@ This document records the version history of the **Photo & Video Rename + Copy T
 
 ---
 
+## v6.9.1 (2025-12)
+
+### 🆕 Format & Tool Compatibility Improvements
+- **Official HEIC support**
+  - Real JPG conversion using ImageMagick (`magick.exe`)
+  - Conversion quality: quality 92
+  - Metadata copied from original HEIC to converted JPG
+- **Automatic tool discovery**
+  - Auto-detect `tools/exiftool/exiftool*.exe`
+  - Use `tools/magick/magick.exe`
+
+---
+
 ## v6.9 (2025-12)
 
 ### 🚀 Execution Stability & UX Improvements
@@ -26,34 +39,4 @@ This document records the version history of the **Photo & Video Rename + Copy T
 - Already processed files are skipped without disk access
 - Noticeable speed improvements in skip-heavy scenarios
 
-### 📖 Documentation Updates
-- Updated README and HowToUse for v6.9 features
-- Added detailed explanations for Resume and progress display
-
 ---
-
-## v6.7 (2025-12)
-
-### ⚡ Performance Optimization & Large-Scale Processing
-- Existing-file caching using HashSet
-- Skip-log summary mode
-- Reduced log I/O overhead
-
-### ⏱️ Enhanced Progress Display
-- Elapsed time, ETA, and total estimated duration
-
----
-
-## v6.5 (2025-12)
-
-### 📁 Simplified Folder Structure & PNG Support
-- Finalized `PHOTO / VIDEO / YYYY / MM / DD` layout
-- Added PNG support
-
----
-
-## v6.3 (2025-12)
-
-### 🎥 Enhanced Video Metadata Handling (MOV Optimized)
-- QuickTime-based capture time prioritization
-- Fixed MOV date sorting issues
